@@ -1,0 +1,747 @@
+---
+title: "dec_making"
+author: "Alina Kereszt"
+date: "2024-07-16"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+pacman::p_load(tidyverse,
+        here,
+        posterior,
+        cmdstanr,
+        brms, 
+        tidybayes,
+        future, 
+        purrr, 
+        furrr,
+        ggplot2,
+        gridExtra,
+        reshape2)
+set.seed(123)
+```
+
+```{r}
+# path to Stan model file
+stan_file <- "stan/two_armed_bandit.stan"
+
+# compile model
+mod <- cmdstan_model(stan_file)
+```
+
+# SIMULATED DATA
+## DATA SIMULATION
+```{r}
+# number of conditions & trials
+nConditions <- 2
+nTrials <- 100
+
+# all the values the parameters can take on
+sim_variables <- expand_grid(
+  alpha_sub = seq(0, 1, by = 0.1), 
+  tau_sub = seq(0, 10, by = 1), 
+  `alpha[1]` = seq(0, 1, by = 0.1),
+  `alpha[2]` = seq(0, 1, by = 0.1),
+  `tau[1]` = seq(1, 10, by = 1),
+  `tau[2]` = seq(1, 10, by = 1))
+
+# NB! this generates a LOT of data... best to filter for the values that are most likely
+```
+
+```{r}
+temp_sim_data <- tibble(
+  condition = rep(1:nConditions, 
+                each = nTrials),
+  trial = rep(1:nTrials, 
+              times = nConditions),
+  choice = NA_integer_,
+  reward = NA_integer_,
+  v1 = rep(0.0, 
+           nConditions * nTrials),
+  v2 = rep(0.0, 
+           nConditions * nTrials),
+  logits = NA,
+  probs = NA,
+  pe = NA
+)
+```
+
+```{r}
+# function for generation reward based choice (1 or 2) and condition (gain or loss)
+generate_reward <- function(choice, condition) {
+  
+  # gain condition
+  if (condition == 1) {
+    if (choice == 1) {
+      sample(c(4, 0), 
+             1, 
+             prob = c(3/5, 2/5))
+    } else if (choice == 2) {
+      sample(c(3, 1), 
+             1, 
+             prob = c(3/4, 1/4))
+    }
+  }
+  
+  # loss condition
+  else if (condition == 2) {
+    if (choice == 1) {
+      sample(c(0, -4), 
+             1, 
+             prob = c(3/5, 2/5))
+    } else if (choice == 2) {
+      sample(c(-1, -3), 
+             1, 
+             prob = c(3/4, 1/4))
+    }
+  }
+}
+```
+
+```{r}
+# function to simulate looping through trials, making choice based on feedback
+# expects input data to contain following cols: 
+# logits, probs, choice, reward, pe, v1, v2, condition, trial
+simulate_data <- function(data, alpha, tau) {
+  
+  # initial estimates for expected value
+  v <- c(0.0, 0.0)
+  
+  # first choice made based on no information - Rescorla-Wagner with inverse temp
+  data$logits[1] <- list(tau * v)
+  data$probs[1] <- list(exp(unlist(data$logits[1])) / sum(exp(unlist(data$logits[1]))))
+  data$choice[1]<- sample(1:2, 1, prob = unlist(data$probs[1]))
+  data$reward[1]<- generate_reward(data$choice[1], data$condition[1])
+  data$pe[1] <- data$reward[1] - v[data$choice[1]]
+  
+  # next choices made based on outcome of previous choices
+  for (j in 2:nrow(data)){
+    
+    # update expected values
+    data$v1[j] = round(if_else(data$choice[j-1] == 1, 
+                               v[1] + alpha * data$pe[j-1], 
+                               v[1]), 
+                       2)
+    data$v2[j] = round(if_else(data$choice[j-1] == 2, 
+                               v[2] + alpha * data$pe[j-1], 
+                               v[2]), 
+                       2)
+    v <- c(data$v1[j], data$v2[j])
+
+    # Rescorla-Wagner with inverse temp
+    data$logits[j] = list(tau * v)
+    data$probs[j] = list(exp(unlist(data$logits[j])) / sum(exp(unlist(data$logits[j]))))
+    data$choice[j] = sample(1:2, 1, prob = unlist(data$probs[j]))
+    data$reward[j] = generate_reward(data$choice[j], data$condition[j])
+    data$pe[j] = data$reward[j] - v[data$choice[j]]
+  }
+  
+  # output data
+  return(data)
+}
+```
+
+```{r}
+# function to run simulation by different conditions
+sim_by_condition <- function(data, alpha_1, alpha_2, tau_1, tau_2){
+  
+  separated <- list()
+  
+  for (c in 1:2){
+    
+    # only include 1 condition
+    by_condition <- data %>% 
+      filter(condition == c)
+    
+    # manage appropriate inputs
+    alpha <- ifelse(c == 1, alpha_1, alpha_2)
+    tau <- ifelse(c == 2, tau_1, tau_2)
+    separated[[c]] <- simulate_data(by_condition, alpha, tau)
+  }
+  
+  # pull into 1 df
+  together <- do.call(rbind, separated)
+  return(together)
+}
+```
+
+```{r}
+# function to simulate data for different values of parameters
+sim_by_parameters <- function(param_grid, data){
+  
+  sim_list <- list()
+  
+  for (i in 1:nrow(param_grid)){
+    
+    # extract parameters
+    alpha_sub <- as.numeric(param_grid[i,1])
+    tau_sub <- as.numeric(param_grid[i,2])
+    alpha1 <- as.numeric(param_grid[i,3])
+    alpha2 <- as.numeric(param_grid[i,4])
+    tau1 <- as.numeric(param_grid[i,5])
+    tau2 <- as.numeric(param_grid[i,6])
+    
+    # run simulation
+    temp_sim <- sim_by_condition(data, alpha1, alpha2, tau1, tau2)
+    
+    # add parameters to df for later handling
+    temp_sim$alpha_sub <- alpha_sub
+    temp_sim$tau_sub <- tau_sub
+    temp_sim$alpha1 <- alpha1
+    temp_sim$alpha2 <- alpha2
+    temp_sim$tau1 <- tau1
+    temp_sim$tau2 <- tau2
+    
+    # assign value for combo for future easy wrangling
+    temp_sim$combo_id <- i
+    
+    sim_list[[i]] <- temp_sim
+  }
+  
+  all_sims <- do.call(rbind, sim_list)
+  return(all_sims)
+}
+```
+
+```{r}
+# randomly sample 20 combinations of possible parameter values
+indices <- sample(nrow(sim_variables), 20)
+sampled_sim_variables <- sim_variables[indices, ]
+```
+
+```{r}
+sims <- sim_by_parameters(sampled_sim_variables, temp_sim_data)
+```
+
+## Parameter recovery
+```{r}
+# function to run Stan model on simulated data and pull into dataframe
+recovery_run <- function(data){
+  
+  estimates_list <- list()
+  
+  for (i in unique(data$combo_id)){
+    
+    combo_id <- i
+    
+    # filter for parameter combo id
+    df <- data %>% 
+      filter(combo_id == i)
+    
+    # transform into array for easy indexing
+    nConditions <- 2 
+    nTrials <- 100
+    recovery_array <- array(NA, 
+                       dim = c(nConditions, nTrials, 2))
+    for (condition in 1:nConditions) {
+      condition_data <- subset(df, 
+                               condition == condition)
+      for (trial in 1:nTrials) {
+        recovery_array[condition, trial, ] <- as.numeric(condition_data[trial, 
+                                                                   c("choice", "reward")])
+      }
+    }
+    
+    # collect all necessary data
+    recovery_data <- list(nConditions=nConditions,
+                    nTrials=nTrials, 
+                    choice=recovery_array[,,1], 
+                    reward=recovery_array[,,2])
+    
+    # run model
+    recovery_samples <- mod$sample(
+      data = recovery_data, 
+      seed = 123, 
+      chains = 2,  
+      parallel_chains = 2, 
+      threads_per_chain = 2, 
+      iter_warmup = 1000, 
+      iter_sampling = 2000, 
+      refresh = 0, 
+      output_dir = "simmodels", 
+      max_treedepth = 20, 
+      adapt_delta = 0.99, 
+    )
+    
+    recovery_draws_df <- as_draws_df(recovery_samples$draws())
+    
+    # pull into tibble
+    estimates <- tibble(
+      combo_id = combo_id,
+      E_alpha_sub = recovery_draws_df$alpha_sub,
+      E_tau_sub = recovery_draws_df$tau_sub,
+      E_alpha1 = recovery_draws_df$`alpha[1]`,
+      E_alpha2 = recovery_draws_df$`alpha[2]`,
+      E_tau1 = recovery_draws_df$`tau[1]`,
+      E_tau2 = recovery_draws_df$`tau[2]`
+    )
+    
+    estimates_list[[i]] <- estimates
+  }
+  
+  estimates_df <- do.call(rbind, estimates_list)
+  return(estimates_df)
+}
+```
+
+```{r}
+recovery_df <- recovery_run(sims)
+```
+
+```{r}
+recovery_summary <- recovery_df %>% 
+  group_by(combo_id) %>% 
+  summarize(mean_E_alpha_sub = mean(E_alpha_sub),
+            mean_E_tau_sub = mean(E_tau_sub),
+            mean_E_alpha1 = mean(E_alpha1),
+            mean_E_alpha2 = mean(E_alpha2),
+            mean_E_tau1 = mean(E_tau1),
+            mean_E_tau2 = mean(E_tau2))
+```
+
+```{r}
+params <- sims %>% 
+  select(c(combo_id, alpha_sub, tau_sub, alpha1, alpha2, tau1, tau2)) %>% 
+  unique()
+```
+
+```{r}
+recovery_summary <- left_join(recovery_summary, params)
+```
+
+# MODEL REAL DATA
+```{r}
+# load data
+df <- read.csv("psychopy/logfile_David_2024-07_15_17h27.05.734.csv")
+```
+
+```{r}
+# turn numeric so Stan can process
+df <- df %>%
+  mutate(
+    condition = recode(condition, 
+                       "gain" = 1, 
+                       "loss" = 2),
+    choice = recode(choice,
+                    "left" = 2,
+                    "right" = 1))
+```
+
+```{r}
+real1 <- ggplot(df, 
+       aes(x = as.factor(condition), 
+           fill = as.factor(choice))) +
+  geom_bar(position = "dodge") +
+  labs(x = "Condition", 
+       y = "Number of times right arm was chosen out of 100 trials", 
+       fill = "Choice") +
+  scale_x_discrete(labels = c("1" = "Gain", 
+                              "2" = "Loss")) +
+  scale_fill_manual(values = c("1" = "darkblue", "2" = "darkred")) + 
+  theme_minimal()
+```
+
+```{r}
+# function to find how many times the player switched arm
+count_changes <- function(x) {
+  sum(diff(x) != 0)
+}
+
+# count changes in arm
+change_summary_real <- df %>%
+  group_by(condition) %>%
+  summarize(c = count_changes(choice))
+
+
+real2 <- ggplot(change_summary_real, 
+       aes(x = as.factor(condition),
+           y = c,
+           fill = as.factor(condition))) +
+  geom_bar(stat = "identity") +
+  scale_x_discrete(labels = c("1" = "Gain", 
+                              "2" = "Loss")) +
+  scale_fill_manual(values = c("1" = "darkblue", "2" = "darkred")) + 
+  labs(x = "Condition", 
+       y = "Changes in arm in 100 trials") +
+  theme_minimal() +
+  theme(legend.position = "none")
+```
+
+```{r}
+real_behavior_plot <- grid.arrange(real1, 
+                                   real2, 
+                                   ncol = 2)
+
+ggsave("plots/real_behavior_plot.png", 
+       real_behavior_plot,
+       width = 10,
+       height = 7)
+```
+
+## Run Stan
+```{r}
+nConditions = 2
+nTrials = 100
+
+# transform into array for easy indexing
+real_array <- array(NA, 
+                   dim = c(nConditions, nTrials, 2))
+for (condition in 1:nConditions) {
+  condition_data <- subset(df, 
+                           condition == condition)
+  for (trial in 1:nTrials) {
+    real_array[condition, trial, ] <- as.numeric(condition_data[trial, 
+                                                               c("choice", "reward")])
+  }
+}
+```
+
+```{r}
+# collect all necessary data
+real_data = list(nConditions=nConditions,
+            nTrials=nTrials, 
+            choice=real_array[,,1], 
+            reward=real_array[,,2])
+```
+
+```{r}
+# run model
+real_samples <- mod$sample(
+  data = real_data, 
+  seed = 123, 
+  chains = 2,  
+  parallel_chains = 2, 
+  threads_per_chain = 2, 
+  iter_warmup = 1000,
+  iter_sampling = 2000, 
+  refresh = 0,
+  output_dir = "simmodels",
+  max_treedepth = 20, 
+  adapt_delta = 0.99,
+)
+```
+
+```{r}
+# summary
+real_samples$summary()
+```
+
+```{r}
+# diagnostics
+real_samples$cmdstan_diagnose()
+```
+
+```{r}
+# pull results into tibble
+real_draws_df <- as_draws_df(real_samples$draws())
+```
+
+## Model quality checks
+### Chain plots
+```{r}
+real_chains1 <- ggplot(real_draws_df, 
+       aes(.iteration,
+           alpha_sub_raw, 
+           group = .chain, 
+           color = .chain)) +
+  geom_line() +
+  theme_classic()
+
+real_chains2 <- ggplot(real_draws_df, 
+       aes(.iteration,
+           tau_sub_raw, 
+           group = .chain, 
+           color = .chain)) +
+  geom_line() +
+  theme_classic()
+
+real_chains3 <- ggplot(real_draws_df, 
+       aes(.iteration,
+           `alpha_raw[1]`, 
+           group = .chain, 
+           color = .chain)) +
+  geom_line() +
+  theme_classic()
+
+real_chains4 <- ggplot(real_draws_df, 
+       aes(.iteration,
+           `alpha_raw[2]`, 
+           group = .chain, 
+           color = .chain)) +
+  geom_line() +
+  theme_classic()
+
+real_chains5 <- ggplot(real_draws_df, 
+       aes(.iteration,
+           `tau_raw[1]`, 
+           group = .chain, 
+           color = .chain)) +
+  geom_line() +
+  theme_classic()
+
+real_chains6 <- ggplot(real_draws_df, 
+       aes(.iteration,
+           `tau_raw[2]`, 
+           group = .chain, 
+           color = .chain)) +
+  geom_line() +
+  theme_classic()
+
+real_chains_plot <- grid.arrange(real_chains1, 
+                                real_chains2, 
+                                real_chains3, 
+                                real_chains4, 
+                                real_chains5, 
+                                real_chains6, 
+                                ncol = 2)
+
+ggsave("plots/real_chains_plot.png", 
+       real_chains_plot,
+       width = 10,
+       height = 7)
+```
+
+### Prior predictive checks
+```{r}
+# pattern for necessary columns
+prior_cols <- grep("y_pred_prior\\[\\d+,\\d+\\]", 
+                   names(real_draws_df), 
+                   value = TRUE)
+
+# pivot longer for easy plotting
+data_long_prior <- real_draws_df %>%
+  mutate(index = row_number()) %>% 
+  select(c(index, all_of(prior_cols))) %>% 
+  pivot_longer(cols = all_of(prior_cols), 
+               names_to = "variable", 
+               values_to = "value")
+
+# fix names
+data_long_prior <- data_long_prior %>%
+  mutate(
+    condition = as.integer(sub("y_pred_prior\\[(\\d+),\\d+\\]", "\\1", variable)),
+    trial = as.integer(sub("y_pred_prior\\[\\d+,(\\d+)\\]", "\\1", variable))
+  ) %>%
+  select(-variable)
+```
+
+```{r}
+# number of times the right arm is chosen out of 100
+count_summary_prior <- data_long_prior %>%
+  filter(value == 1) %>%
+  group_by(index, condition) %>%
+  summarise(n = n(), .groups = 'drop')
+
+# plot
+real_prior_preds_1 <- ggplot(count_summary_prior, aes(x = n)) +
+  geom_histogram(binwidth = 1, 
+                 fill = "darkred") +
+  facet_wrap(~ condition) +
+  labs(x = "Number of times right arm is chosen out of 100",
+       y = "Frequency") +
+  xlim(0, 100) +
+  theme_minimal()
+
+ggsave("plots/real_prior_preds_1.png", 
+       real_prior_preds_1,
+       width = 10,
+       height = 5)
+
+real_prior_preds_1
+```
+
+```{r}
+# function to find how many times the player switched arm
+count_changes <- function(x) {
+  sum(diff(x) != 0)
+}
+
+# count changes in arm
+change_summary_prior <- data_long_prior %>%
+  group_by(index, condition) %>%
+  summarize(c = count_changes(value))
+
+# plot
+real_prior_preds_2 <- ggplot(change_summary_prior, aes(x = c)) +
+  geom_histogram(binwidth = 1, 
+                 fill = "darkblue") +
+  facet_wrap(~ condition) +
+  labs(x = "Count of changes in arm in 100 rounds",
+       y = "Frequency") +
+  xlim(0, 100) +
+  theme_minimal()
+
+ggsave("plots/real_prior_preds_2.png", 
+       real_prior_preds_2,
+       width = 10,
+       height = 7)
+
+real_prior_preds_2
+```
+
+### Posterior predictive checks
+```{r}
+# same as with prior predictive checks
+# pattern for necessary columns
+posterior_cols <- grep("y_pred_posterior\\[\\d+,\\d+\\]", 
+                   names(real_draws_df), 
+                   value = TRUE)
+
+# pivot longer for easy plotting
+data_long_post <- real_draws_df %>%
+  mutate(index = row_number()) %>% 
+  select(c(index, all_of(posterior_cols))) %>% 
+  pivot_longer(cols = all_of(posterior_cols), 
+               names_to = "variable", 
+               values_to = "value")
+
+# fix names
+data_long_post <- data_long_post %>%
+  mutate(
+    condition = as.integer(sub("y_pred_posterior\\[(\\d+),\\d+\\]", "\\1", variable)),
+    trial = as.integer(sub("y_pred_posterior\\[\\d+,(\\d+)\\]", "\\1", variable))
+  ) %>%
+  select(-variable)
+```
+
+```{r}
+# number of times the right arm is chosen out of 100
+count_summary_post <- data_long_post %>%
+  filter(value == 1) %>%
+  group_by(index, condition) %>%
+  summarise(n = n(), .groups = 'drop')
+
+# plot
+real_post_preds_1 <- ggplot(count_summary_post, aes(x = n)) +
+  geom_histogram(binwidth = 1, 
+                 fill = "darkred") +
+  facet_wrap(~ condition) +
+  labs(x = "Number of times right arm is chosen out of 100",
+       y = "Frequency") +
+  xlim(0, 100) +
+  theme_minimal()
+
+ggsave("plots/real_post_preds_1.png", 
+       real_post_preds_1,
+       width = 10,
+       height = 7)
+```
+
+```{r}
+# count changes in arm
+change_summary_post <- data_long_post %>%
+  group_by(index, condition) %>%
+  summarize(c = count_changes(value))
+
+# plot
+real_post_preds_2 <- ggplot(change_summary_post, aes(x = c)) +
+  geom_histogram(binwidth = 1, 
+                 fill = "darkblue") +
+  facet_wrap(~ condition) +
+  labs(x = "Count of changes in arm in 100 rounds",
+       y = "Frequency") +
+  xlim(0, 100) +
+  theme_minimal()
+
+ggsave("plots/real_post_preds_2.png", 
+       real_post_preds_2,
+       width = 10,
+       height = 7)
+
+real_post_preds_2
+```
+
+### Prior-posterior update checks
+```{r}
+# prior-posterior update checks
+real_ppu1 <- ggplot(real_draws_df) +
+  geom_density(aes(alpha_sub), fill = "blue", alpha = 0.3) +
+  geom_density(aes(alpha_sub_prior), fill = "red", alpha = 0.3) +
+  labs(x = "Overall subject alpha",
+       y = "Posterior Density") +
+  theme_classic() +
+  theme(plot.title = element_text(size = 11),
+        axis.title.x = element_text(size = 9),
+        axis.title.y = element_text(size = 9))
+
+real_ppu2 <- ggplot(real_draws_df) +
+  geom_density(aes(tau_sub), fill = "blue", alpha = 0.3) +
+  geom_density(aes(tau_sub_prior), fill = "red", alpha = 0.3) +
+  labs(x = "Overall subject tau",
+       y = "Posterior Density") +
+  theme_classic() +
+  theme(plot.title = element_text(size = 11),
+        axis.title.x = element_text(size = 9),
+        axis.title.y = element_text(size = 9))
+
+real_ppu3 <- ggplot(real_draws_df) +
+  geom_density(aes(`alpha[1]`), fill = "blue", alpha = 0.3) +
+  geom_density(aes(`alpha_prior[1]`), fill = "red", alpha = 0.3) +
+  labs(x = "Alpha for gain condition",
+       y = "Posterior Density") +
+  theme_classic() +
+  theme(plot.title = element_text(size = 11),
+        axis.title.x = element_text(size = 9),
+        axis.title.y = element_text(size = 9))
+
+real_ppu4 <- ggplot(real_draws_df) +
+  geom_density(aes(`tau[1]`), fill = "blue", alpha = 0.3) +
+  geom_density(aes(`tau_prior[1]`), fill = "red", alpha = 0.3) +
+  labs(x = "Tau for gain condition",
+       y = "Posterior Density") +
+  theme_classic() +
+  theme(plot.title = element_text(size = 11),
+        axis.title.x = element_text(size = 9),
+        axis.title.y = element_text(size = 9))
+
+real_ppu5 <- ggplot(real_draws_df) +
+  geom_density(aes(`alpha[2]`), fill = "blue", alpha = 0.3) +
+  geom_density(aes(`alpha_prior[2]`), fill = "red", alpha = 0.3) +
+  labs(x = "Alpha for loss condition",
+       y = "Posterior Density") +
+  theme_classic() +
+  theme(plot.title = element_text(size = 11),
+        axis.title.x = element_text(size = 9),
+        axis.title.y = element_text(size = 9))
+
+real_ppu6 <- ggplot(real_draws_df) +
+  geom_density(aes(`tau[2]`), fill = "blue", alpha = 0.3) +
+  geom_density(aes(`tau_prior[2]`), fill = "red", alpha = 0.3) +
+  labs(x = "Tau for loss condition",
+       y = "Posterior Density") +
+  theme_classic() +
+  theme(plot.title = element_text(size = 11),
+        axis.title.x = element_text(size = 9),
+        axis.title.y = element_text(size = 9))
+
+real_ppu_plot <- grid.arrange(real_ppu1, 
+                              real_ppu2, 
+                              real_ppu3, 
+                              real_ppu4, 
+                              real_ppu5, 
+                              real_ppu6, 
+                              ncol = 2)
+
+ggsave("plots/real_ppu_plot.png", 
+       real_ppu_plot,
+       width = 10,
+       height = 7)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
